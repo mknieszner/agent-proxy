@@ -1,0 +1,13 @@
+.idea/
+*.iml
+target/
+logs/
+/playground/
+frontend/node_modules/
+frontend/.angular/
+src/main/resources/static/
+.env
+.env.*
+!.env.example
+application-local.properties
+src/main/resources/application-local.properties
