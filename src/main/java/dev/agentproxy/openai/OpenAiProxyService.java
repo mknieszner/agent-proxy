@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.agentproxy.shared.ModelProviderClient;
 import dev.agentproxy.shared.ProviderRequest;
-import dev.agentproxy.shared.ProviderResponse;
 import dev.agentproxy.shared.ProxyExchangeLogger;
 import dev.agentproxy.shared.ProxyLogEntry;
 import jakarta.servlet.http.HttpServletRequest;
@@ -52,9 +51,7 @@ public class OpenAiProxyService {
             "transfer-encoding",
             "upgrade"
     );
-    private static final String LOGGED_CHAT_COMPLETIONS_PATH = "/v1/chat/completions";
-    private static final Set<String> LOGGED_PATHS = Set.of(LOGGED_CHAT_COMPLETIONS_PATH, "/v1/responses");
-    private static final int MAX_CHAT_COMPLETION_ATTEMPTS = 2;
+    private static final Set<String> LOGGED_PATHS = Set.of("/v1/responses");
     private static final Pattern VALID_HTTP_HEADER_NAME = Pattern.compile("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$");
 
     private final ObjectMapper objectMapper;
@@ -114,41 +111,20 @@ public class OpenAiProxyService {
                     requestHeaders(servletRequest),
                     body
             );
-            for (int attempt = 1; attempt <= MAX_CHAT_COMPLETION_ATTEMPTS; attempt++) {
-                var upstreamResponse = modelProviderClient.send(providerRequest);
-                var responseBody = upstreamResponse.body();
-                var validation = validateChatCompletion(upstreamPath, upstreamResponse);
-                var willRetry = !validation.complete() && attempt < MAX_CHAT_COMPLETION_ATTEMPTS;
-                if (shouldLogExchange) {
-                    var responsePayload = new LinkedHashMap<String, Object>();
-                    responsePayload.put("status", upstreamResponse.statusCode());
-                    responsePayload.put("headers", sanitizedHeaders(upstreamResponse.headers()));
-                    responsePayload.put("body", parseJsonOrText(responseBody));
-                    responsePayload.put("durationMs", Duration.between(startedAt, Instant.now()).toMillis());
-                    responsePayload.put("attempt", attempt);
-                    responsePayload.put("complete", validation.complete());
-                    if (!validation.complete()) {
-                        responsePayload.put("validationError", validation.error());
-                        responsePayload.put("willRetry", willRetry);
-                    }
-                    exchangeLogger.append(new ProxyLogEntry(
-                            exchangeId,
-                            Instant.now(),
-                            "proxy-response",
-                            responsePayload
-                    ));
-                }
-                if (validation.complete()) {
-                    return responseEntity(upstreamResponse.statusCode(), upstreamResponse.headers(), responseBody);
-                }
-                if (!willRetry) {
-                    throw new IncompleteChatCompletionException(
-                            "Upstream chat completion remained incomplete after "
-                                    + MAX_CHAT_COMPLETION_ATTEMPTS + " attempts: " + validation.error()
-                    );
-                }
+            var upstreamResponse = modelProviderClient.send(providerRequest);
+            var responseBody = upstreamResponse.body();
+            if (shouldLogExchange) {
+                var responsePayload = new LinkedHashMap<String, Object>();
+                responsePayload.put("status", upstreamResponse.statusCode());
+                responsePayload.put("headers", sanitizedHeaders(upstreamResponse.headers()));
+                responsePayload.put("body", parseJsonOrText(responseBody));
+                responsePayload.put("durationMs", Duration.between(startedAt, Instant.now()).toMillis());
+                responsePayload.put("complete", true);
+                exchangeLogger.append(new ProxyLogEntry(
+                        exchangeId, Instant.now(), "proxy-response", responsePayload
+                ));
             }
-            throw new IllegalStateException("Chat completion retry loop exited unexpectedly.");
+            return responseEntity(upstreamResponse.statusCode(), upstreamResponse.headers(), responseBody);
         } catch (Exception exception) {
             if (shouldLogExchange) {
                 exchangeLogger.append(new ProxyLogEntry(
@@ -170,85 +146,6 @@ public class OpenAiProxyService {
 
     private boolean shouldLogExchange(String upstreamPath) {
         return LOGGED_PATHS.contains(upstreamPath);
-    }
-
-    private CompletionValidation validateChatCompletion(String upstreamPath, ProviderResponse response) {
-        if (!LOGGED_CHAT_COMPLETIONS_PATH.equals(upstreamPath)
-                || response.statusCode() < 200
-                || response.statusCode() >= 300) {
-            return CompletionValidation.success();
-        }
-        if (!StringUtils.hasText(response.body())) {
-            return CompletionValidation.failure("Upstream returned an empty response body.");
-        }
-        return isEventStream(response) ? validateEventStream(response.body()) : validateJsonCompletion(response.body());
-    }
-
-    private boolean isEventStream(ProviderResponse response) {
-        var contentTypeIsEventStream = response.headers().entrySet().stream()
-                .filter(entry -> HttpHeaders.CONTENT_TYPE.equalsIgnoreCase(entry.getKey()))
-                .flatMap(entry -> entry.getValue().stream())
-                .anyMatch(value -> value.toLowerCase(Locale.ROOT).contains("text/event-stream"));
-        return contentTypeIsEventStream || response.body().stripLeading().startsWith("data:");
-    }
-
-    private CompletionValidation validateJsonCompletion(String responseBody) {
-        try {
-            var response = objectMapper.readTree(responseBody);
-            var choices = response.path("choices");
-            return choices.isArray() && !choices.isEmpty()
-                    ? CompletionValidation.success()
-                    : CompletionValidation.failure("JSON response contained no choices.");
-        } catch (Exception exception) {
-            return CompletionValidation.failure("Upstream returned malformed completion JSON.");
-        }
-    }
-
-    private CompletionValidation validateEventStream(String responseBody) {
-        var hasChoice = false;
-        var hasFinishReason = false;
-        var hasDoneEvent = false;
-
-        for (String rawLine : responseBody.split("\\R", -1)) {
-            var line = rawLine.trim();
-            if (!line.startsWith("data:")) {
-                continue;
-            }
-            var data = line.substring("data:".length()).trim();
-            if ("[DONE]".equals(data)) {
-                hasDoneEvent = true;
-                continue;
-            }
-            if (!StringUtils.hasText(data)) {
-                continue;
-            }
-            try {
-                var event = objectMapper.readTree(data);
-                var choices = event.path("choices");
-                if (!choices.isArray() || choices.isEmpty()) {
-                    continue;
-                }
-                hasChoice = true;
-                for (JsonNode choice : choices) {
-                    if (StringUtils.hasText(choice.path("finish_reason").asText(null))) {
-                        hasFinishReason = true;
-                    }
-                }
-            } catch (Exception exception) {
-                return CompletionValidation.failure("SSE stream contained a malformed data event.");
-            }
-        }
-
-        if (!hasChoice) {
-            return CompletionValidation.failure("SSE stream contained no choices.");
-        }
-        if (!hasFinishReason) {
-            return CompletionValidation.failure("SSE stream ended without a finish_reason.");
-        }
-        if (!hasDoneEvent) {
-            return CompletionValidation.failure("SSE stream ended without data: [DONE].");
-        }
-        return CompletionValidation.success();
     }
 
     private Map<String, Object> sanitizedHeaders(HttpServletRequest request) {
@@ -326,9 +223,7 @@ public class OpenAiProxyService {
             return objectMapper.writeValueAsString(Map.of(
                     "error", Map.of(
                             "message", rootMessage(exception),
-                            "type", exception instanceof IncompleteChatCompletionException
-                                    ? "agent_proxy_incomplete_upstream_response"
-                                    : "agent_proxy_proxy_error"
+                            "type", "agent_proxy_proxy_error"
                     )
             ));
         } catch (IOException jsonException) {
@@ -344,21 +239,4 @@ public class OpenAiProxyService {
         return cursor.getMessage() != null ? cursor.getMessage() : cursor.getClass().getName();
     }
 
-    private record CompletionValidation(boolean complete, String error) {
-
-        private static CompletionValidation success() {
-            return new CompletionValidation(true, null);
-        }
-
-        private static CompletionValidation failure(String error) {
-            return new CompletionValidation(false, error);
-        }
-    }
-
-    private static class IncompleteChatCompletionException extends RuntimeException {
-
-        private IncompleteChatCompletionException(String message) {
-            super(message);
-        }
-    }
 }

@@ -31,10 +31,10 @@ test('real Copilot session context separates new sessions sharing the same corre
   assert.ok(sessions.every(s => s.correlationIds[0] === 'session-1'));
 });
 
-test('actual session identity survives different headers, Windows paths and supported protocols', async () => {
+test('actual session identity survives different headers, Windows paths and instructions', async () => {
   const { groupLogEntries, groupLogSessions } = await modulePromise;
   const groups = groupLogEntries([request('a', 1, [context(sessionOne), user('Hi')], 'correlation-a'),
-    request('b', 2, [], 'correlation-b', { messages: [context(sessionOne, true), user('Hi')] }),
+    request('b', 2, [context(sessionOne, true), user('Hi')], 'correlation-b'),
     request('c', 3, [user('Next')], '', { instructions: context(sessionOne).content[0].text })]);
   const [session] = groupLogSessions(groups);
   assert.equal(session.sessionId, sessionOne);
@@ -126,13 +126,12 @@ test('unknown lineage, missing session and orphan responses remain separate exch
   assert.equal(sessions.find(s => !s.correlationIds.length).groups.length, 3);
 });
 
-test('Chat Completions history also splits turns and counts all supported message formats', async () => {
+test('Responses history splits user turns and counts messages separately from tool items', async () => {
   const { groupLogEntries, requestMessageCount } = await modulePromise;
-  const groups = groupLogEntries([request('a', 1, null, 'session-1', { messages: [user('First')] }),
-    request('b', 2, null, 'session-1', { messages: [user('First'), { role: 'tool', content: 'ok' }] }),
-    request('c', 3, null, 'session-1', { messages: [user('First'), user('Second')] })]);
+  const groups = groupLogEntries([request('a', 1, [user('First')]),
+    request('b', 2, [user('First'), { type: 'function_call_output', output: 'ok' }]),
+    request('c', 3, [user('First'), user('Second')])]);
   assert.equal(groups.length, 2);
   assert.equal(requestMessageCount({ input: [user('Hi'), { type: 'reasoning' }, { type: 'function_call' }], instructions: 'System' }), 2);
   assert.equal(requestMessageCount({ input: 'Hi' }), 1);
-  assert.equal(requestMessageCount({ messages: [user('Hi'), { role: 'tool' }] }), 2);
 });

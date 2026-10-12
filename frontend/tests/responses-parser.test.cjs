@@ -27,7 +27,7 @@ test('JSON Responses shows text, tool call IDs, lifecycle and usage', async () =
   assert.equal(result.toolCalls[0].argumentsText, '{"path":"README.md"}');
   assert.equal(result.usage.input_tokens, 20);
   assert.deepEqual(result.finishReasons, ['completed']);
-  assert.equal(result.chatId, 'resp-1');
+  assert.equal(result.responseId, 'resp-1');
 });
 
 test('SSE deltas and final snapshots do not duplicate text or arguments', async () => {
@@ -75,8 +75,8 @@ test('failed and incomplete Responses statuses remain visible', async () => {
   }
 });
 
-test('Chat Completions remains handled by its existing parser', async () => {
+test('unknown and malformed payloads remain available as raw logs without a Responses preview', async () => {
   const { parseResponsesBody } = await parser;
-  assert.equal(parseResponsesBody({ choices: [{ message: { content: 'Hello' } }] }), null);
-  assert.equal(parseResponsesBody('data: {"choices":[]}\n\ndata: [DONE]\n\n'), null);
+  assert.equal(parseResponsesBody({ error: { message: 'Invalid parameter' } }), null);
+  assert.equal(parseResponsesBody('data: invalid-json\n\n'), null);
 });

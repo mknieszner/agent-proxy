@@ -29,18 +29,18 @@ class OpenAiCompatControllerTest {
     }
 
     @Test
-    void forwardsChatCompletionsBodyToModelProviderUpstream() throws Exception {
-        var request = new MockHttpServletRequest("POST", "/v1/chat/completions");
+    void forwardsResponsesBodyToModelProviderUpstream() throws Exception {
+        var request = new MockHttpServletRequest("POST", "/v1/responses");
         var body = objectMapper.readTree("""
-                {"model":"gpt-4.1","messages":[{"role":"user","content":"test"}]}
+                {"model":"gpt-5.6-terra","input":"test"}
                 """);
-        var expected = ResponseEntity.ok("{\"choices\":[]}");
-        when(proxyService.proxyPost("/v1/chat/completions", request, body)).thenReturn(expected);
+        var expected = ResponseEntity.ok("{\"object\":\"response\",\"output\":[]}");
+        when(proxyService.proxyPost("/v1/responses", request, body)).thenReturn(expected);
 
-        var actual = controller.chatCompletions(request, body);
+        var actual = controller.responses(request, body);
 
         assertThat(actual).isSameAs(expected);
-        verify(proxyService).proxyPost("/v1/chat/completions", request, body);
+        verify(proxyService).proxyPost("/v1/responses", request, body);
     }
 
 }

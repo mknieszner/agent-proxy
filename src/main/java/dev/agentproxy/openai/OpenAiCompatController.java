@@ -22,11 +22,6 @@ public class OpenAiCompatController {
         return proxyService.proxyGet("/v1/models", request);
     }
 
-    @PostMapping("/v1/chat/completions")
-    ResponseEntity<String> chatCompletions(HttpServletRequest request, @RequestBody JsonNode body) {
-        return proxyService.proxyPost("/v1/chat/completions", request, body);
-    }
-
     @PostMapping("/v1/responses")
     ResponseEntity<String> responses(HttpServletRequest request, @RequestBody JsonNode body) {
         return proxyService.proxyPost("/v1/responses", request, body);

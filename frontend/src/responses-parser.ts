@@ -20,7 +20,7 @@ export function parseResponsesBody(body: any) {
           .filter(line => line.startsWith('data:'))
           .map(line => line.slice(5).trimStart()).join('\n');
         try {
-          if (data && data !== '[DONE]') chunks.push(JSON.parse(data));
+          if (data) chunks.push(JSON.parse(data));
         } catch {
           // The raw log still contains malformed or unknown events.
         }
@@ -35,7 +35,7 @@ export function parseResponsesBody(body: any) {
   const tools = new Map<number, ResponsesToolCall>();
   const finishReasons: string[] = [];
   let model = '';
-  let chatId = '';
+  let responseId = '';
   let usage: any = null;
   let contentChunkCount = 0;
   let toolArgumentChunkCount = 0;
@@ -65,7 +65,7 @@ export function parseResponsesBody(body: any) {
     const response = isResponse ? chunk : chunk.response;
     if (response) {
       model = response.model ?? model;
-      chatId = response.id ?? chatId;
+      responseId = response.id ?? responseId;
       if (response.usage) {
         usage = response.usage;
         usageChunkCount++;
@@ -102,7 +102,7 @@ export function parseResponsesBody(body: any) {
       const [bOutput, bContent] = b.split(':').map(Number);
       return aOutput - bOutput || aContent - bContent;
     }).map(([, value]) => value).join(''),
-    chunks, finishReasons, model, chatId, toolCalls: [...tools.values()], usage,
+    chunks, finishReasons, model, responseId, toolCalls: [...tools.values()], usage,
     contentChunkCount, toolArgumentChunkCount, finishChunkCount, usageChunkCount
   };
 }

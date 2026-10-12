@@ -22,7 +22,7 @@ import static org.mockito.Mockito.when;
 
 class OpenAiProxyServiceTest {
 
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
     private final ModelProviderClient modelProviderClient = mock(ModelProviderClient.class);
     private final ProxyExchangeLogger exchangeLogger = mock(ProxyExchangeLogger.class);
     private final OpenAiProxyService service = new OpenAiProxyService(
@@ -55,173 +55,63 @@ class OpenAiProxyServiceTest {
     }
 
     @Test
-    void sendsChatCompletionBodyThroughModelProviderClient() throws Exception {
-        var request = new MockHttpServletRequest("POST", "/v1/chat/completions");
+    void sendsResponsesBodyThroughModelProviderClient() throws Exception {
+        var request = new MockHttpServletRequest("POST", "/v1/responses");
         request.addHeader("openai-project", "project-1");
         request.addHeader("x-interaction-id", "interaction-1");
         var body = objectMapper.readTree("""
-                {"model":"gpt-4.1","messages":[{"role":"user","content":"hello"}]}
+                {"model":"gpt-5.6-terra","input":"hello"}
                 """);
-        when(modelProviderClient.upstreamUri("/v1/chat/completions", null))
-                .thenReturn("https://provider.example/v1/chat/completions");
+        when(modelProviderClient.upstreamUri("/v1/responses", null))
+                .thenReturn("https://provider.example/v1/responses");
         when(modelProviderClient.send(any())).thenReturn(new ProviderResponse(
                 200,
                 Map.of("content-type", List.of("application/json")),
-                "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}"
+                "{\"object\":\"response\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}]}"
         ));
 
-        var response = service.proxyPost("/v1/chat/completions", request, body);
+        var response = service.proxyPost("/v1/responses", request, body);
 
         var providerRequest = ArgumentCaptor.forClass(ProviderRequest.class);
         verify(modelProviderClient).send(providerRequest.capture());
         assertThat(providerRequest.getValue().method()).isEqualTo("POST");
-        assertThat(providerRequest.getValue().path()).isEqualTo("/v1/chat/completions");
+        assertThat(providerRequest.getValue().path()).isEqualTo("/v1/responses");
         assertThat(providerRequest.getValue().body()).isSameAs(body);
         assertThat(providerRequest.getValue().headers()).containsEntry("x-interaction-id", List.of("interaction-1"));
         assertThat(providerRequest.getValue().headers()).containsKey("openai-project");
         assertThat(response.getStatusCode().value()).isEqualTo(200);
-        assertThat(response.getBody()).contains("\"content\":\"hello\"");
+        assertThat(response.getBody()).contains("\"text\":\"hello\"");
 
         var logEntry = ArgumentCaptor.forClass(ProxyLogEntry.class);
         verify(exchangeLogger, times(2)).append(logEntry.capture());
         assertThat(logEntry.getAllValues().get(0).payload())
                 .asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.MAP)
-                .containsEntry("path", "/v1/chat/completions");
+                .containsEntry("path", "/v1/responses");
         assertThat(logEntry.getAllValues().get(1).payload())
                 .asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.MAP)
-                .containsEntry("attempt", 1)
                 .containsEntry("complete", true);
     }
 
     @Test
-    void retriesAnIncompleteEventStreamAndReturnsTheCompleteSecondAttempt() throws Exception {
-        var request = new MockHttpServletRequest("POST", "/v1/chat/completions");
-        var body = objectMapper.readTree("""
-                {"model":"gpt-4.1","stream":true,"messages":[{"role":"user","content":"hello"}]}
-                """);
-        var incompleteStream = """
-                data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\\"filePath\\\":\\\"test.java\\\""}}]},"finish_reason":null}]}
+    void transportFailureReturns502AndLogsAnErrorWithoutRetry() throws Exception {
+        var request = new MockHttpServletRequest("POST", "/v1/responses");
+        request.addHeader("Authorization", "Bearer client-secret");
+        when(modelProviderClient.upstreamUri("/v1/responses", null))
+                .thenReturn("https://provider.example/v1/responses");
+        when(modelProviderClient.send(any())).thenThrow(new java.io.IOException("Upstream unavailable"));
 
-                """;
-        var completeStream = """
-                data: {"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":null}]}
+        var response = service.proxyPost("/v1/responses", request,
+                objectMapper.readTree("{\"input\":\"hello\"}"));
 
-                data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
-
-                data: [DONE]
-
-                """;
-        when(modelProviderClient.upstreamUri("/v1/chat/completions", null))
-                .thenReturn("https://provider.example/v1/chat/completions");
-        when(modelProviderClient.send(any()))
-                .thenReturn(eventStreamResponse(incompleteStream), eventStreamResponse(completeStream));
-
-        var response = service.proxyPost("/v1/chat/completions", request, body);
-
-        verify(modelProviderClient, times(2)).send(any());
-        assertThat(response.getStatusCode().value()).isEqualTo(200);
-        assertThat(response.getBody()).isEqualTo(completeStream);
-
-        var logEntry = ArgumentCaptor.forClass(ProxyLogEntry.class);
-        verify(exchangeLogger, times(3)).append(logEntry.capture());
-        assertThat(logEntry.getAllValues().get(1).payload())
-                .asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.MAP)
-                .containsEntry("attempt", 1)
-                .containsEntry("complete", false)
-                .containsEntry("willRetry", true)
-                .containsEntry("validationError", "SSE stream ended without a finish_reason.");
-        assertThat(logEntry.getAllValues().get(2).payload())
-                .asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.MAP)
-                .containsEntry("attempt", 2)
-                .containsEntry("complete", true);
-    }
-
-    @Test
-    void returnsBadGatewayWhenBothEventStreamAttemptsAreIncomplete() throws Exception {
-        var request = new MockHttpServletRequest("POST", "/v1/chat/completions");
-        var body = objectMapper.readTree("""
-                {"model":"gpt-4.1","stream":true,"messages":[{"role":"user","content":"hello"}]}
-                """);
-        var incompleteStream = """
-                data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}
-
-                """;
-        when(modelProviderClient.upstreamUri("/v1/chat/completions", null))
-                .thenReturn("https://provider.example/v1/chat/completions");
-        when(modelProviderClient.send(any())).thenReturn(eventStreamResponse(incompleteStream));
-
-        var response = service.proxyPost("/v1/chat/completions", request, body);
-
-        verify(modelProviderClient, times(2)).send(any());
         assertThat(response.getStatusCode().value()).isEqualTo(502);
         assertThat(objectMapper.readTree(response.getBody()).path("error").path("type").asText())
-                .isEqualTo("agent_proxy_incomplete_upstream_response");
-        assertThat(objectMapper.readTree(response.getBody()).path("error").path("message").asText())
-                .contains("SSE stream ended without a finish_reason");
-        verify(exchangeLogger, times(4)).append(any());
-    }
-
-    @Test
-    void retriesAnEventStreamThatHasAFinishReasonButNoDoneEvent() throws Exception {
-        var request = new MockHttpServletRequest("POST", "/v1/chat/completions");
-        var body = objectMapper.readTree("""
-                {"model":"gpt-4.1","stream":true,"messages":[{"role":"user","content":"hello"}]}
-                """);
-        var incompleteStream = """
-                data: {"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}
-
-                """;
-        var completeStream = incompleteStream + "data: [DONE]\n\n";
-        when(modelProviderClient.upstreamUri("/v1/chat/completions", null))
-                .thenReturn("https://provider.example/v1/chat/completions");
-        when(modelProviderClient.send(any()))
-                .thenReturn(eventStreamResponse(incompleteStream), eventStreamResponse(completeStream));
-
-        var response = service.proxyPost("/v1/chat/completions", request, body);
-
-        verify(modelProviderClient, times(2)).send(any());
-        assertThat(response.getStatusCode().value()).isEqualTo(200);
-        assertThat(response.getBody()).isEqualTo(completeStream);
-
-        var logEntry = ArgumentCaptor.forClass(ProxyLogEntry.class);
-        verify(exchangeLogger, times(3)).append(logEntry.capture());
-        assertThat(logEntry.getAllValues().get(1).payload())
-                .asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.MAP)
-                .containsEntry("validationError", "SSE stream ended without data: [DONE].");
-    }
-
-    @Test
-    void acceptsAnEventStreamWithAUsageOnlyEmptyChoicesEvent() throws Exception {
-        var request = new MockHttpServletRequest("POST", "/v1/chat/completions");
-        var body = objectMapper.readTree("""
-                {"model":"gpt-4.1","stream":true,"messages":[{"role":"user","content":"hello"}]}
-                """);
-        var completeStream = """
-                data: {"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":null}]}
-
-                data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
-
-                data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}
-
-                data: [DONE]
-
-                """;
-        when(modelProviderClient.upstreamUri("/v1/chat/completions", null))
-                .thenReturn("https://provider.example/v1/chat/completions");
-        when(modelProviderClient.send(any())).thenReturn(eventStreamResponse(completeStream));
-
-        var response = service.proxyPost("/v1/chat/completions", request, body);
-
+                .isEqualTo("agent_proxy_proxy_error");
+        assertThat(response.getBody()).contains("Upstream unavailable");
         verify(modelProviderClient).send(any());
-        assertThat(response.getStatusCode().value()).isEqualTo(200);
-        assertThat(response.getBody()).isEqualTo(completeStream);
-    }
-
-    private ProviderResponse eventStreamResponse(String body) {
-        return new ProviderResponse(
-                200,
-                Map.of("content-type", List.of("text/event-stream; charset=utf-8")),
-                body
-        );
+        var entries = ArgumentCaptor.forClass(ProxyLogEntry.class);
+        verify(exchangeLogger, times(2)).append(entries.capture());
+        assertThat(entries.getAllValues().get(1).kind()).isEqualTo("proxy-error");
+        assertThat(entries.getAllValues().get(1).id()).isEqualTo(entries.getAllValues().get(0).id());
+        assertThat(objectMapper.writeValueAsString(entries.getAllValues())).doesNotContain("client-secret");
     }
 }

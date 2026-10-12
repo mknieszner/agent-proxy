@@ -32,7 +32,6 @@ function header(entry: any, name: string): string {
 }
 
 function messages(body: any): any[] {
-  if (Array.isArray(body?.messages)) return body.messages;
   return typeof body?.input === 'string' ? [{ role: 'user', content: body.input }] : array(body?.input);
 }
 

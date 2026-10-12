@@ -10,7 +10,7 @@ import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 import { parseResponsesBody } from './responses-parser';
 import { groupLogEntries, groupLogSessions, requestMessageCount, LogEntryGroup, LogSession } from './log-grouping';
-import { buildLabRequest, requestErrorMessage, RequestApi } from './request-lab';
+import { buildLabRequest, requestErrorMessage } from './request-lab';
 
 type Tab = 'status' | 'request' | 'logs';
 
@@ -104,7 +104,7 @@ interface ParsedResponse {
   chunks: any[];
   finishReasons: string[];
   model: string;
-  chatId: string;
+  responseId: string;
   toolCalls: ResponseToolCallDetail[];
   usage: any | null;
   contentChunkCount: number;
@@ -420,7 +420,7 @@ class EntryDetailsDialogComponent {
           </div>
           <div>
             <span class="label">Copilot endpoint</span>
-            <strong><code>/v1/responses</code>, <code>/v1/chat/completions</code></strong>
+            <strong><code>/v1/responses</code></strong>
           </div>
           <div>
             <span class="label">Models</span>
@@ -464,14 +464,6 @@ class EntryDetailsDialogComponent {
           </select>
         </label>
 
-        <label>
-          API
-          <select [(ngModel)]="requestApi" [disabled]="sending">
-            <option value="responses">Responses</option>
-            <option value="chat-completions">Chat Completions</option>
-          </select>
-        </label>
-
         <label class="wide">
           Prompt
           <textarea [(ngModel)]="prompt" rows="8"></textarea>
@@ -479,7 +471,7 @@ class EntryDetailsDialogComponent {
 
         <div class="toolbar">
           <button type="button" [disabled]="sending || !selectedModel.trim() || !prompt.trim()" (click)="send()">Send proxy request</button>
-          <span *ngIf="sending">waiting for {{ requestApi === 'responses' ? '/v1/responses' : '/v1/chat/completions' }}...</span>
+          <span *ngIf="sending">waiting for /v1/responses...</span>
           <span class="error" *ngIf="sendError">{{ sendError }}</span>
         </div>
 
@@ -614,7 +606,6 @@ class AppComponent implements OnInit {
   sending = false;
   sendError = '';
   selectedModel = '';
-  requestApi: RequestApi = 'responses';
   prompt = 'Reply exactly: AGENT_PROXY_MODEL_PROVIDER_COMPAT_OK';
   lastResponse: ParsedResponse | null = null;
   selectedEntry: any | null = null;
@@ -908,15 +899,11 @@ class AppComponent implements OnInit {
         'model',
         'temperature',
         'top_p',
-        'max_tokens',
-        'max_completion_tokens',
         'max_output_tokens',
         'stream',
-        'stop',
         'tool_choice',
         'parallel_tool_calls',
-        'response_format',
-        'reasoning_effort',
+        'text',
         'reasoning',
         'previous_response_id',
         'store',
@@ -940,8 +927,9 @@ class AppComponent implements OnInit {
       this.addParam(params, 'id', body?.id);
       this.addParam(params, 'model', body?.model);
       this.addParam(params, 'object', body?.object);
-      this.addParam(params, 'created', body?.created);
-      this.addParam(params, 'choices', this.asArray(body?.choices).length);
+      this.addParam(params, 'created_at', body?.created_at);
+      this.addParam(params, 'response status', body?.status);
+      this.addParam(params, 'output items', this.asArray(body?.output).length);
       this.addParam(params, 'usage', body?.usage);
       return params;
     }
@@ -962,28 +950,12 @@ class AppComponent implements OnInit {
         messages.push(this.toMessageDetail({ ...item, role: item.role ?? item.type, content: item.content ?? item.output ?? item.arguments },
           messages.length, { source: `input[${index}]` }, `input[${index}]`));
       });
-      this.asArray(body?.messages).forEach((message, bodyIndex) => {
-        messages.push(this.toMessageDetail(
-          message,
-          messages.length,
-          { source: `messages[${bodyIndex}]` },
-          `messages[${bodyIndex}]`
-        ));
-      });
       return messages;
     }
 
     if (entry?.kind === 'proxy-response') {
-      if (Array.isArray(body?.output)) {
-        return body.output.map((item: any, index: number) => this.toMessageDetail(
-          { ...item, role: item.role ?? item.type, content: item.content ?? item.arguments }, index));
-      }
-      return this.asArray(body?.choices)
-        .map((choice, index) => this.toMessageDetail(choice?.message ?? choice?.delta ?? {}, index, {
-          choiceIndex: choice?.index,
-          finishReason: choice?.finish_reason
-        }))
-        .filter(message => message.role || message.content || message.extra);
+      return this.asArray(body?.output).map((item: any, index: number) => this.toMessageDetail(
+        { ...item, role: item.role ?? item.type, content: item.content ?? item.arguments }, index));
     }
 
     return [];
@@ -992,7 +964,7 @@ class AppComponent implements OnInit {
   entryTools(entry: any): ToolDetail[] {
     const body = this.entryBody(entry);
     return this.asArray(body?.tools).map((tool, index) => {
-      const definition = tool?.function ?? tool;
+      const definition = tool;
       return {
         index,
         name: definition?.name ?? `tool-${index + 1}`,
@@ -1023,8 +995,8 @@ class AppComponent implements OnInit {
     this.addParam(overview, 'error parameter', responseError?.param);
     this.addParam(overview, 'durationMs', payload.durationMs);
     this.addParam(overview, 'model', parsed.model);
-    this.addParam(overview, 'response id', parsed.chatId);
-    this.addParam(overview, 'finish reason', finishReasons.join(', '));
+    this.addParam(overview, 'response id', parsed.responseId);
+    this.addParam(overview, 'response status', finishReasons.join(', '));
     this.addParam(overview, 'SSE chunks', parsed.chunks.length);
     this.addParam(overview, 'content chars', parsed.assistantText.length);
     this.addParam(overview, 'tool calls', parsed.toolCalls.length);
@@ -1053,142 +1025,14 @@ class AppComponent implements OnInit {
     if (responses) {
       return { ...responses, toolCalls: responses.toolCalls.map(call => this.toResponseToolCallDetail(call)) };
     }
-    if (typeof body !== 'string') {
-      return this.parseNonStreamingResponse(body);
+    let value = body;
+    if (typeof body === 'string') {
+      try { value = JSON.parse(body); } catch { value = null; }
     }
-    try {
-      return this.parseNonStreamingResponse(JSON.parse(body));
-    } catch {
-      // Streaming responses are parsed below.
-    }
-
-    const chunks: any[] = [];
-    let assistantText = '';
-    let model = '';
-    let chatId = '';
-    let usage: any | null = null;
-    let contentChunkCount = 0;
-    let toolArgumentChunkCount = 0;
-    let finishChunkCount = 0;
-    let usageChunkCount = 0;
-    const finishReasons: string[] = [];
-    const toolCalls = new Map<number, {
-      index: number;
-      id: string;
-      type: string;
-      name: string;
-      argumentsText: string;
-    }>();
-
-    for (const line of body.split(/\r?\n/)) {
-      if (!line.startsWith('data: ')) {
-        continue;
-      }
-      const data = line.slice(6);
-      if (data === '[DONE]') {
-        continue;
-      }
-
-      let chunk: any;
-      try {
-        chunk = JSON.parse(data);
-      } catch {
-        continue;
-      }
-
-      chunks.push(chunk);
-      model ||= chunk.model ?? '';
-      chatId ||= chunk.id ?? '';
-      if (chunk.usage) {
-        usage = chunk.usage;
-        usageChunkCount += 1;
-      }
-
-      for (const choice of this.asArray(chunk.choices)) {
-        const finishReason = choice?.finish_reason;
-        if (finishReason) {
-          finishReasons.push(finishReason);
-          finishChunkCount += 1;
-        }
-
-        const delta = choice?.delta ?? {};
-        if (typeof delta.content === 'string') {
-          assistantText += delta.content;
-          contentChunkCount += 1;
-        }
-
-        for (const toolCallDelta of this.asArray(delta.tool_calls)) {
-          const index = Number(toolCallDelta.index ?? 0);
-          const current = toolCalls.get(index) ?? {
-            index,
-            id: '',
-            type: '',
-            name: '',
-            argumentsText: ''
-          };
-          if (toolCallDelta.id) {
-            current.id = toolCallDelta.id;
-          }
-          if (toolCallDelta.type) {
-            current.type = toolCallDelta.type;
-          }
-          if (toolCallDelta.function?.name) {
-            current.name += toolCallDelta.function.name;
-          }
-          if (toolCallDelta.function?.arguments) {
-            current.argumentsText += toolCallDelta.function.arguments;
-            toolArgumentChunkCount += 1;
-          }
-          toolCalls.set(index, current);
-        }
-      }
-    }
-
     return {
-      assistantText,
-      chunks,
-      finishReasons,
-      model,
-      chatId,
-      toolCalls: Array.from(toolCalls.values()).map(toolCall => this.toResponseToolCallDetail(toolCall)),
-      usage,
-      contentChunkCount,
-      toolArgumentChunkCount,
-      finishChunkCount,
-      usageChunkCount
-    };
-  }
-
-  private parseNonStreamingResponse(body: any): ParsedResponse {
-    const choices = this.asArray(body?.choices);
-    const assistantText = choices
-      .map(choice => this.contentToText(choice?.message?.content ?? choice?.delta?.content ?? ''))
-      .join('');
-    const finishReasons = choices
-      .map(choice => choice?.finish_reason)
-      .filter(Boolean);
-    const toolCalls = choices
-      .flatMap(choice => this.asArray(choice?.message?.tool_calls ?? choice?.delta?.tool_calls))
-      .map((toolCall, index) => this.toResponseToolCallDetail({
-        index,
-        id: toolCall?.id ?? '',
-        type: toolCall?.type ?? '',
-        name: toolCall?.function?.name ?? '',
-        argumentsText: toolCall?.function?.arguments ?? ''
-      }));
-
-    return {
-      assistantText,
-      chunks: body ? [body] : [],
-      finishReasons,
-      model: body?.model ?? '',
-      chatId: body?.id ?? '',
-      toolCalls,
-      usage: body?.usage ?? null,
-      contentChunkCount: assistantText ? 1 : 0,
-      toolArgumentChunkCount: toolCalls.length,
-      finishChunkCount: finishReasons.length,
-      usageChunkCount: body?.usage ? 1 : 0
+      assistantText: '', chunks: value ? [value] : [], finishReasons: [],
+      model: '', responseId: '', toolCalls: [], usage: null,
+      contentChunkCount: 0, toolArgumentChunkCount: 0, finishChunkCount: 0, usageChunkCount: 0
     };
   }
 
@@ -1227,16 +1071,16 @@ class AppComponent implements OnInit {
     if (!usage) {
       this.addParam(params, 'source', 'estimated; provider did not report usage');
       this.addParam(params, 'estimated_output_tokens', estimatedOutputTokens ? `~${estimatedOutputTokens}` : 'unavailable');
-      this.addParam(params, 'estimation method', 'assistant, reasoning and tool-call output at ~4 chars/token');
+      this.addParam(params, 'estimation method', 'visible assistant text and tool-call arguments at ~4 chars/token');
       return params;
     }
-    this.addParam(params, 'prompt_tokens', usage.prompt_tokens ?? usage.input_tokens);
-    this.addParam(params, 'completion_tokens', usage.completion_tokens ?? usage.output_tokens);
+    this.addParam(params, 'input_tokens', usage.input_tokens);
+    this.addParam(params, 'output_tokens', usage.output_tokens);
     this.addParam(params, 'total_tokens', usage.total_tokens);
-    const promptTokens = usage.prompt_tokens ?? usage.input_tokens;
-    const cachedTokens = usage.prompt_tokens_details?.cached_tokens ?? usage.input_tokens_details?.cached_tokens;
+    const promptTokens = usage.input_tokens;
+    const cachedTokens = usage.input_tokens_details?.cached_tokens;
     this.addParam(params, 'cached_tokens', cachedTokens);
-    this.addParam(params, 'reasoning_tokens', usage.completion_tokens_details?.reasoning_tokens ?? usage.output_tokens_details?.reasoning_tokens);
+    this.addParam(params, 'reasoning_tokens', usage.output_tokens_details?.reasoning_tokens);
     if (promptTokens && cachedTokens !== undefined) {
       const ratio = (Number(cachedTokens) / Number(promptTokens)) * 100;
       this.addParam(params, 'cache ratio', `${ratio.toFixed(1)}%`);
@@ -1439,15 +1283,15 @@ class AppComponent implements OnInit {
     const parsed = this.parseResponseBody(entry?.payload?.body);
     const usage = parsed.usage ?? {};
     const hasReportedUsage = parsed.usage !== null && parsed.usage !== undefined;
-    const hasReportedPromptTokens = usage.prompt_tokens != null || usage.input_tokens != null;
-    const promptTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0);
-    const completionTokens = Number(usage.completion_tokens ?? usage.output_tokens ?? 0);
+    const hasReportedPromptTokens = usage.input_tokens != null;
+    const promptTokens = Number(usage.input_tokens ?? 0);
+    const completionTokens = Number(usage.output_tokens ?? 0);
     const model = parsed.model || '';
     return {
       promptTokens,
       completionTokens,
       totalTokens: Number(usage.total_tokens ?? promptTokens + completionTokens),
-      cachedTokens: Number(usage.prompt_tokens_details?.cached_tokens ?? usage.input_tokens_details?.cached_tokens ?? 0),
+      cachedTokens: Number(usage.input_tokens_details?.cached_tokens ?? 0),
       maxPromptTokens: promptTokens,
       estimatedMaxPromptTokens: 0,
       contextLimit: this.contextLimitForModel(model),
@@ -1459,15 +1303,13 @@ class AppComponent implements OnInit {
   private requestUsageEstimate(entry: any): TokenUsageSummary {
     const body = entry?.payload?.body ?? {};
     const promptShape = {
-      messages: body.messages,
       input: body.input,
       instructions: body.instructions,
       tools: body.tools,
       tool_choice: body.tool_choice,
-      response_format: body.response_format
+      text: body.text
     };
-    const hasPromptData = promptShape.messages !== undefined
-      || promptShape.input !== undefined || promptShape.instructions !== undefined
+    const hasPromptData = promptShape.input !== undefined || promptShape.instructions !== undefined
       || promptShape.tools !== undefined;
     const estimatedPromptTokens = hasPromptData
       ? Math.max(1, Math.ceil(JSON.stringify(promptShape).length / 4))
@@ -1480,33 +1322,9 @@ class AppComponent implements OnInit {
   }
 
   private estimatedCompletionTokens(parsed: ParsedResponse): number {
-    let outputText = '';
-    let foundChoiceOutput = false;
-
-    for (const chunk of parsed.chunks) {
-      for (const choice of this.asArray(chunk?.choices)) {
-        const output = choice?.delta ?? choice?.message ?? {};
-        const content = this.contentToText(output.content ?? '');
-        const reasoning = this.contentToText(output.reasoning ?? output.reasoning_content ?? '');
-        if (content || reasoning) {
-          outputText += content + reasoning;
-          foundChoiceOutput = true;
-        }
-        for (const toolCall of this.asArray(output.tool_calls)) {
-          const toolOutput = `${toolCall?.function?.name ?? ''}${toolCall?.function?.arguments ?? ''}`;
-          if (toolOutput) {
-            outputText += toolOutput;
-            foundChoiceOutput = true;
-          }
-        }
-      }
-    }
-
-    if (!foundChoiceOutput) {
-      outputText = parsed.assistantText + parsed.toolCalls
-        .map(toolCall => `${toolCall.name}${toolCall.argumentsText}`)
-        .join('');
-    }
+    const outputText = parsed.assistantText + parsed.toolCalls
+      .map(toolCall => `${toolCall.name}${toolCall.argumentsText}`)
+      .join('');
     return outputText ? Math.max(1, Math.ceil(outputText.length / 4)) : 0;
   }
 
@@ -1608,7 +1426,7 @@ class AppComponent implements OnInit {
   send(): void {
     let request: ReturnType<typeof buildLabRequest>;
     try {
-      request = buildLabRequest(this.requestApi, this.selectedModel, this.prompt);
+      request = buildLabRequest(this.selectedModel, this.prompt);
     } catch (error: any) {
       this.sendError = error.message;
       return;

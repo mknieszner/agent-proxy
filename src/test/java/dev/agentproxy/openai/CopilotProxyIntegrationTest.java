@@ -38,7 +38,7 @@ class CopilotProxyIntegrationTest {
 
     private static final BlockingQueue<CapturedRequest> requests = new LinkedBlockingQueue<>();
     private static final HttpServer upstream = startUpstream();
-    private static volatile String responseBody = "{\"choices\":[{\"message\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}";
+    private static volatile String responseBody = "{\"object\":\"response\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}]}";
     private static volatile String responseContentType = "application/json";
     private static volatile int responseStatus = 200;
 
@@ -65,7 +65,7 @@ class CopilotProxyIntegrationTest {
     @BeforeEach
     void resetUpstream() {
         requests.clear();
-        responseBody = "{\"choices\":[{\"message\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}";
+        responseBody = "{\"object\":\"response\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}]}";
         responseContentType = "application/json";
         responseStatus = 200;
     }
@@ -80,19 +80,19 @@ class CopilotProxyIntegrationTest {
         var body = """
                 {
                   "model":"custom-model",
-                  "messages":[
+                  "input":[
                     {"role":"system","content":"Follow the project rules."},
-                    {"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},
-                    {"role":"tool","tool_call_id":"call-1","content":"file contents"},
+                    {"type":"function_call","call_id":"call-1","name":"read_file","arguments":"{}"},
+                    {"type":"function_call_output","call_id":"call-1","output":"file contents"},
                     {"role":"user","content":"Summarize"}
                   ],
-                  "tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}],
+                  "tools":[{"type":"function","name":"read_file","parameters":{"type":"object"}}],
                   "tool_choice":"auto",
                   "parallel_tool_calls":true,
                   "custom_parameter":{"enabled":true}
                 }
                 """;
-        mvc.perform(post("/v1/chat/completions?trace=1")
+        mvc.perform(post("/v1/responses?trace=1")
                         .contentType("application/json")
                         .header("Authorization", "Bearer client-placeholder")
                         .header("openai-project", "project-1")
@@ -106,7 +106,7 @@ class CopilotProxyIntegrationTest {
         var captured = requests.poll(2, TimeUnit.SECONDS);
         assertThat(captured).isNotNull();
         assertThat(captured.method()).isEqualTo("POST");
-        assertThat(captured.uri()).isEqualTo("/v1/chat/completions?trace=1");
+        assertThat(captured.uri()).isEqualTo("/v1/responses?trace=1");
         assertThat(objectMapper.readTree(captured.body())).isEqualTo(objectMapper.readTree(body));
         assertThat(captured.authorization()).isEqualTo("Bearer test-upstream-key");
         assertThat(captured.project()).isEqualTo("project-1");
@@ -129,21 +129,19 @@ class CopilotProxyIntegrationTest {
     }
 
     @Test
-    void returnsAndLogsCompleteSseToolCallsWithoutChangingEvents() throws Exception {
+    void returnsAndLogsResponsesTextSseWithoutChangingEvents() throws Exception {
         responseContentType = "text/event-stream";
         responseBody = """
-                data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":null}]}
+                event: response.output_text.delta
+                data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hello"}
 
-                data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
-
-                data: {"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}
-
-                data: [DONE]
+                event: response.completed
+                data: {"type":"response.completed","response":{"id":"resp-text","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15}}}
 
                 """;
-        mvc.perform(post("/v1/chat/completions")
+        mvc.perform(post("/v1/responses")
                         .contentType("application/json")
-                        .content("{\"model\":\"custom-model\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"Read the file\"}]}"))
+                        .content("{\"model\":\"custom-model\",\"stream\":true,\"input\":\"Read the file\"}"))
                 .andExpect(status().isOk())
                 .andExpect(content().contentTypeCompatibleWith("text/event-stream"))
                 .andExpect(content().string(responseBody));
@@ -250,7 +248,7 @@ class CopilotProxyIntegrationTest {
     }
 
     @Test
-    void preservesResponsesSseWithReasoningToolCallsAndUsageWithoutChatCompletionMarkers() throws Exception {
+    void preservesResponsesSseWithReasoningToolCallsAndUsage() throws Exception {
         responseContentType = "text/event-stream";
         responseBody = """
                 event: response.created
@@ -290,12 +288,11 @@ class CopilotProxyIntegrationTest {
         });
     }
 
-    @ParameterizedTest
-    @ValueSource(strings = {"/v1/responses", "/v1/chat/completions"})
-    void returnsUpstreamErrorsUnchangedWithoutRetry(String path) throws Exception {
+    @Test
+    void returnsUpstreamErrorsUnchangedWithoutRetry() throws Exception {
         responseStatus = 400;
         responseBody = "{\"error\":{\"message\":\"Invalid parameter\",\"type\":\"invalid_request_error\",\"param\":\"reasoning\"}}";
-        mvc.perform(post(path).contentType("application/json").content("{\"model\":\"gpt-5.6-terra\"}"))
+        mvc.perform(post("/v1/responses").contentType("application/json").content("{\"model\":\"gpt-5.6-terra\"}"))
                 .andExpect(status().isBadRequest()).andExpect(content().string(responseBody));
         assertThat(requests.poll(2, TimeUnit.SECONDS)).isNotNull();
         assertThat(requests).isEmpty();
@@ -312,7 +309,7 @@ class CopilotProxyIntegrationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"/v1/messages", "/anthropic/v1/messages", "/v1/messages/count_tokens",
+    @ValueSource(strings = {"/v1/chat/completions", "/v1/messages", "/anthropic/v1/messages", "/v1/messages/count_tokens",
             "/anthropic/v1/messages/count_tokens"})
     void removedProtocolsHaveNoPostEndpoint(String path) throws Exception {
         mvc.perform(post(path).contentType("application/json").content("{}"))

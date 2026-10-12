@@ -10,27 +10,20 @@ const lab = import(`data:text/javascript;base64,${Buffer.from(outputText).toStri
 
 test('missing model or empty prompt cannot reach the upstream', async () => {
   const { buildLabRequest } = await lab;
-  for (const api of ['responses', 'chat-completions']) {
-    assert.throws(() => buildLabRequest(api, ' ', 'Hello'), /Select a model/);
-    assert.throws(() => buildLabRequest(api, 'gpt-5.6-terra', ' '), /Enter a prompt/);
-  }
+  assert.throws(() => buildLabRequest(' ', 'Hello'), /Select a model/);
+  assert.throws(() => buildLabRequest('gpt-5.6-terra', ' '), /Enter a prompt/);
 });
 
-test('both protocols send an explicit model and preserve the prompt', async () => {
+test('Responses sends an explicit model and preserve the prompt', async () => {
   const { buildLabRequest } = await lab;
   const prompt = 'Hello\n  world';
-  const response = buildLabRequest('responses', ' gpt-5.6-terra ', prompt);
+  const response = buildLabRequest(' gpt-5.6-terra ', prompt);
   assert.equal(response.path, '/v1/responses');
   assert.equal(response.body.model, 'gpt-5.6-terra');
   assert.equal(response.body.input, prompt);
   assert.equal(response.body.store, false);
   assert.equal(response.body.stream, false);
-  assert.equal(response.body.messages, undefined);
-  const chat = buildLabRequest('chat-completions', 'gpt-5.6-terra', prompt);
-  assert.equal(chat.path, '/v1/chat/completions');
-  assert.equal(chat.body.model, 'gpt-5.6-terra');
-  assert.deepEqual(chat.body.messages, [{ role: 'user', content: prompt }]);
-  assert.equal(chat.body.input, undefined);
+
 });
 
 test('OpenAI error is shown instead of the generic HTTP message', async () => {
